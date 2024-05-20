@@ -1,0 +1,13 @@
+Requires:
+    libdrm-dev
+    libturbojpeg0-dev
+
+recipes & examples
+
+(curl -so /tmp/frame.jpg 'http://192.168.1.1/cgi-bin/nph-zms?mode=single&monitor=1' \
+    echo /tmp/frame.jpg; sleep 1) | ./console-jpeg
+
+
+
+(while true; do dd if=/dev/random bs=3 count=1 2>/dev/null | hexdump -e \
+    '"bgcolor:" 3/1 "%02x" "\n"'; echo clear; echo wait:0.1; done) | ./console-jpeg
