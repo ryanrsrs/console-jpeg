@@ -840,8 +840,22 @@ int main(int argc, const char* argv[])
             }
         }
         else {
-            err = drmModePageFlip(My_Card->fd_drm, crtc_id, FB0->fb_id, 0, 0);
-            if (err && errno == EBUSY) {
+            // Schedule buffer flip.
+            // May need to wait for vblank and retry if was are generating
+            // frames faster than the refresh rate.
+            while (1) {
+                err = drmModePageFlip(My_Card->fd_drm, crtc_id, FB0->fb_id, 0, 0);
+                if (err == 0) {
+                    // success
+                    break;
+                }
+                if (errno != EBUSY) {
+                    // a real error
+                    perror("drmModePageFlip(FB0)");
+                    return 3;
+                }
+
+                // EBUSY
                 // We tried to schedule a buffer flip while another flip
                 // was still pending. We are drawing frames faster than the
                 // monitor refresh.
@@ -850,21 +864,9 @@ int main(int argc, const char* argv[])
                 // small jpegs. It's not worth setting up events and a select
                 // loop. We handle it here.
                 //
-                // With full size jpegs the decode time is longer than
-                // the vblank interval and this doesn't happen.
-                drmVBlank vblank;
-                memset(&vblank, 0, sizeof(vblank));
-                vblank.request.type = DRM_VBLANK_RELATIVE;
-                vblank.request.sequence = 1;
-                drmWaitVBlank(My_Card->fd_drm, &vblank);
-
-                // the prev image was just displayed, so we can queue up
-                // our page flip now
-                err = drmModePageFlip(My_Card->fd_drm, crtc_id, FB0->fb_id, 0, 0);
-            }
-            if (err) {
-                perror("drmModePageFlip(FB0)");
-                return 3;
+                // drmWaitVBlank() was always returning EINVAL
+                // Sleeping for 5 ms and retrying works, too.
+                sleep_f(5e-3);
             }
         }
         swap_frame_buffers();
