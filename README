@@ -1,13 +1,137 @@
+console-jpeg
+============
+
+Console-jpeg is a simple program to display images on a screen, without X.
+It can be used to make a digital picture frame or show a slideshow.
+
+When console-jpeg exits, the screen reverts to whatever it was showing before,
+such as a login prompt or a bunch of printks. Console-jpeg never leaves an
+image on the screen after it exists.
+
+Capabilities:
+ - Show a jpeg on the screen.
+ - Fill the screen with a solid color.
+ - Sleep/wake the display on command.
+
 Requires:
     libdrm-dev
     libturbojpeg0-dev
 
-recipes & examples
 
-(curl -so /tmp/frame.jpg 'http://192.168.1.1/cgi-bin/nph-zms?mode=single&monitor=1' \
-    echo /tmp/frame.jpg; sleep 1) | ./console-jpeg
-
+Major goals for development were simplicity, few dependencies, and easy
+integration with shell scripts and other command line tools.
 
 
-(while true; do dd if=/dev/random bs=3 count=1 2>/dev/null | hexdump -e \
-    '"bgcolor:" 3/1 "%02x" "\n"'; echo clear; echo wait:0.1; done) | ./console-jpeg
+---------------------------------------------------------------------------
+Note: Console-jpeg will probably NOT work on your nVidia or AMD discrete
+GPU. It was written and tested on ARM SBCs with unified memory integrated
+graphics like the Raspberry Pi.
+---------------------------------------------------------------------------
+
+
+Usage:
+    ./your_script | console-jpeg [options] [commands]
+
+
+Options:
+
+--list
+    List all available outputs. Pass the output number to --out=N.
+
+--dev=/dev/dri/card1
+    Specify device (rarely needed!)
+
+    Normally, console-jpeg looks at every device, filtering out the render-
+    only nodes, and enumerating the connectors on all mode-setting / frame
+    buffer nodes. This is important because the card numbers are dynamically
+    assigned at boot and NOT consistent from boot-to-boot. Usually specifying
+    the output using only --out=N is the best way to get the same monitor
+    every time.
+
+--out=N
+    Use output connector N. See: --list.
+
+
+
+Commands:
+
+    Commands passed as command line arguments are run first. After that,
+    commands are read from stdin.
+
+bgcolor:ffffff
+    Set the background color to hex RGB. This affects the color of borders
+    around jpegs and the color of the clear command. This command does not
+    change what is currently on the screen.
+
+clear
+    Fill screen with bgcolor.
+
+black
+white
+    Fill screen with black or white.
+
+jpeg:filename.jpg
+filename.jpg
+    Display a jpeg. The image is roughly scaled to fit the screen, using
+    libjpegturbo's scaling code. Libjpegturbo supports scale factors from
+    1/8 - 2x, in multiples of 1/8. Console-jpeg picks the largest scale factor
+    that gives an image <= the screen size. Any remaining border around the
+    image is filled with bgcolor. The "jpeg:" prefix is optional.
+
+wait:1.5
+    Pause this many seconds.
+
+halt
+    Pause forever. (Ctrl-C to quit)
+
+exit
+    Quit program. Use this as the final command line argument if you don't
+    want console-jpeg to read commands from stdin.
+
+sleep
+    Put the display to sleep (power down). Wake it up with clear, black,
+    white, or a jpeg.
+
+
+
+
+Recipes & Examples
+==================
+
+Show a jpeg:
+    $ console-jpeg filename.jpg
+
+    Type exit or ctrl+D or ctrl+C to exit program.
+
+
+Slideshow. Show every jpeg in a directory for 5 seconds:
+    printf '%s\nwait:5\n' *.jpg | console-jpeg
+
+
+Same slideshow, but the script uses sleep for pacing:
+    (for x in *.jpg; do echo "$x"; sleep 5; done) | console-jpeg
+
+
+Zoneminder camera snapshot every ~5 secs:
+    ZM_URL="http://192.168.1.1/cgi-bin/nph-zms?mode=single&monitor=1"
+    ZM_PIC="/tmp/zm-pic.jpg"
+    (curl -so "$ZM_PIC" "$ZM_URL"; echo "$ZM_PIC"; sleep 5) | console-jpeg
+
+
+Put the display to sleep for 10 seconds:
+    console-jpeg sleep wait:10 exit
+
+
+
+License
+=======
+
+MIT License. See file LICENSE in this directory.
+
+
+
+Author
+======
+
+Ryan Salsbury
+ryanrs@gmail.com
