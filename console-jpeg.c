@@ -20,7 +20,7 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
-volatile bool Quit = 0;
+volatile bool Quit = false;
 
 void ctrl_c_handler(int signum)
 {
@@ -292,21 +292,54 @@ int jpeg_decode(struct Mapped_Jpeg* jpeg, struct Frame_Buffer* fb)
         return -1;
     }
 
-    fprintf(stderr, "jpeg: %ix%i %i %i\n", jpeg_width, jpeg_height, subsamp, color);
-
-    int scaled_width;
-    int scaled_height;
+    const bool trace_scale = false;
+    if (trace_scale) fprintf(stderr, "jpeg: %ix%i\n", jpeg_width, jpeg_height);
 
     // Find largest scaling factor for result <= display size.
-    int scale;
-    for (scale = 16; scale > 0; scale--) {
-        scaled_width = jpeg_width * scale / 8;
-        scaled_height = jpeg_height * scale / 8;
-        if (scaled_width <= fb->width && scaled_height <= fb->height) {
-            break;
+    int scaled_width = jpeg_width;
+    int scaled_height = jpeg_height;
+    bool too_big = jpeg_width > fb->width || jpeg_height > fb->height;
+    int sf_n;
+    tjscalingfactor* sf = tjGetScalingFactors(&sf_n);
+    if (sf && sf_n > 0) {
+        int i;
+        for (i = 0; i < sf_n; i++) {
+            if (trace_scale) fprintf(stderr, "scale %i/%i", sf[i].num, sf[i].denom);
+            int sf_w = TJSCALED(jpeg_width, sf[i]);
+            int sf_h = TJSCALED(jpeg_height, sf[i]);
+            if (too_big) {
+                // need to shrink
+                if (sf_w < scaled_width || sf_h < scaled_height) {
+                    // smaller than previous
+                    scaled_width = sf_w;
+                    scaled_height = sf_h;
+                    if (trace_scale) fprintf(stderr, " -");
+                    if (scaled_width <= fb->width && scaled_height <= fb->height) {
+                        too_big = false;
+                    }
+                }
+            }
+            else {
+                // need to enlarge
+                if (sf_w <= fb->width && sf_h <= fb->height) {
+                    // scaled <= screen size
+                    if (sf_w > scaled_width || sf_h > scaled_height) {
+                        // larger than previous
+                        scaled_width = sf_w;
+                        scaled_height = sf_h;
+                        if (trace_scale) fprintf(stderr, " +");
+                    }
+                }
+            }
+            if (trace_scale) fprintf(stderr, "\n");
         }
     }
-    fprintf(stderr, "scale %i/8\n", scale);
+
+    if (too_big) {
+        fprintf(stderr, "jpeg image too large.\n");
+        tjDestroy(inst);
+        return -1;
+    }
 
     // Borders, if scaled image is less than screen size.
     int blank_top = 0;
@@ -325,7 +358,23 @@ int jpeg_decode(struct Mapped_Jpeg* jpeg, struct Frame_Buffer* fb)
         blank_right = delta - blank_left;
     }
 
-    uint32_t* pixels = (uint32_t*)fb->pixels;
+    uint32_t* pixels = fb->pixels;
+
+    if (trace_scale) {
+        fprintf(stderr, "fb->width   %4i\n", fb->width);
+        fprintf(stderr, "fb->height  %4i\n", fb->height);
+        fprintf(stderr, "fb->pitch   %4i\n", fb->pitch);
+        fprintf(stderr, "fb->size    %4i\n", fb->size);
+        fprintf(stderr, "fb->pitch32 %4i\n", fb->pitch32);
+        fprintf(stderr, "fb->size32  %4i\n", fb->size32);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "scaled_width  %4i\n", scaled_width);
+        fprintf(stderr, "scaled_height %4i\n", scaled_height);
+        fprintf(stderr, "blank_left    %4i\n", blank_left);
+        fprintf(stderr, "blank_right   %4i\n", blank_right);
+        fprintf(stderr, "blank_top     %4i\n", blank_top);
+        fprintf(stderr, "blank_bottom  %4i\n", blank_bottom);
+    }
 
     // top border + left border of first row
     int blank = blank_top * fb->width + blank_left;
@@ -843,8 +892,9 @@ int main(int argc, const char* argv[])
 
             struct Mapped_Jpeg* jpeg = jpeg_create(filename);
             if (jpeg == 0) continue; // bad filename or corrupt image
-            jpeg_decode(jpeg, FB0);
+            err = jpeg_decode(jpeg, FB0);
             jpeg_destroy(jpeg);
+            if (err) continue;
         }
 
         if (first_flip) {
