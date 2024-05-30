@@ -6,7 +6,7 @@ It can be used to make a digital picture frame or show a slideshow.
 
 When console-jpeg exits, the screen reverts to whatever it was showing before,
 such as a login prompt or a bunch of printks. Console-jpeg never leaves an
-image on the screen after it exists.
+image on the screen after it exits.
 
 Capabilities:
  - Show a jpeg on the screen.

@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -18,6 +19,13 @@
 
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+
+volatile bool Quit = 0;
+
+void ctrl_c_handler(int signum)
+{
+    Quit = true;
+}
 
 // Return floating point seconds since first call
 // First call always returns 0.0
@@ -45,6 +53,7 @@ void sleep_f(double secs)
     rem.tv_nsec = ns % 1000000000ULL;
     while (nanosleep(&rem, &rem)) {
         if (errno != EINTR) break;
+        if (Quit) break; // caught ctrl-c
         // else ignore interrupted system call
     }
 }
@@ -749,7 +758,12 @@ int main(int argc, const char* argv[])
     }
 
     uint32_t crtc_id = encoder->crtc_id;
-    //drmModeCrtc* saved_crtc = drmModeGetCrtc(My_Card->fd_drm, crtc_id);
+    drmModeCrtc* saved_crtc = drmModeGetCrtc(My_Card->fd_drm, crtc_id);
+
+    struct sigaction act = { 0 };
+    act.sa_handler = ctrl_c_handler;
+    act.sa_flags = 0; // no SA_RESTART, otherwise fgets blocks ctrl+c
+    sigaction(SIGINT, &act, 0);
 
     // Double buffering:
     // First buffer uses drmModeSetCrtc().
@@ -757,7 +771,8 @@ int main(int argc, const char* argv[])
     // Also need drmModeSetCrtc() to come out of display power-down.
     bool first_flip = true;
     char buf[1024];
-    while (1) {
+    int ret = 0;
+    while (!Quit) {
         // Process commands, frist from the command line, then from stdin.
         const char* command;
         if (argi < argc) {
@@ -802,14 +817,16 @@ int main(int argc, const char* argv[])
             err = drmModeSetCrtc(My_Card->fd_drm, crtc_id, 0, 0, 0, 0, 0, 0);
             if (err) {
                 perror("drmModeSetCrtc(sleep)");
-                return 3;
+                ret = 3;
+                goto Cleanup;
             }
             first_flip = true;
             continue;
         }
         else if (!strcmp(command, "halt")) {
             // wait forever
-            while (1) sleep(10);
+            while (!Quit) sleep(10);
+            break;
         }
         else if (!strcmp(command, "exit")) {
             break;
@@ -836,14 +853,15 @@ int main(int argc, const char* argv[])
                          &My_Conn->drm_conn->connector_id, 1, mode_info);
             if (err) {
                 perror("drmModeSetCrtc(FB0)");
-                return 3;
+                ret = 3;
+                goto Cleanup;
             }
         }
         else {
             // Schedule buffer flip.
             // May need to wait for vblank and retry if was are generating
             // frames faster than the refresh rate.
-            while (1) {
+            while (!Quit) {
                 err = drmModePageFlip(My_Card->fd_drm, crtc_id, FB0->fb_id, 0, 0);
                 if (err == 0) {
                     // success
@@ -852,7 +870,8 @@ int main(int argc, const char* argv[])
                 if (errno != EBUSY) {
                     // a real error
                     perror("drmModePageFlip(FB0)");
-                    return 3;
+                    ret = 3;
+                    goto Cleanup;
                 }
 
                 // EBUSY
@@ -871,5 +890,12 @@ int main(int argc, const char* argv[])
         }
         swap_frame_buffers();
     }
-    return 0;
+
+Cleanup:
+    if (saved_crtc) {
+        drmModeSetCrtc(My_Card->fd_drm, saved_crtc->crtc_id,
+            saved_crtc->buffer_id, saved_crtc->x, saved_crtc->y,
+            &My_Conn->drm_conn->connector_id, 1, &saved_crtc->mode);
+    }
+    return ret;
 }
