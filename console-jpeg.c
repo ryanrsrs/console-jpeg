@@ -20,6 +20,8 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
+#include "stb_image_resize2.h"
+
 volatile bool Quit = false;
 
 void ctrl_c_handler(int signum)
@@ -60,6 +62,7 @@ void sleep_f(double secs)
 
 // Memory-mapped jpeg file.
 struct Mapped_Jpeg {
+    char* filename;
     unsigned char* data;
     size_t length;
 };
@@ -81,8 +84,8 @@ struct Mapped_Jpeg* jpeg_create(const char* filename)
     }
 
     // very arbitrary limit
-    if (st.st_size > 100000000) {
-        fprintf(stderr, "Input jpeg larger than 100MB.\n");
+    if ((st.st_size >> 20) > 500) {
+        fprintf(stderr, "Input jpeg larger than 500 MB.\n");
         close(fd);
         return 0;
     }
@@ -97,6 +100,15 @@ struct Mapped_Jpeg* jpeg_create(const char* filename)
     close(fd);
 
     struct Mapped_Jpeg* jpeg = malloc(sizeof(struct Mapped_Jpeg));
+    char* name = strdup(filename);
+    if (jpeg == 0 || name == 0) {
+        free(jpeg);
+        free(name);
+        munmap(addr, st.st_size);
+        fprintf(stderr, "Out of memory at line %i.\n", __LINE__);
+        return 0;
+    }
+    jpeg->filename = name;
     jpeg->data = (unsigned char*)addr;
     jpeg->length = st.st_size;
     return jpeg;
@@ -105,6 +117,7 @@ struct Mapped_Jpeg* jpeg_create(const char* filename)
 void jpeg_destroy(struct Mapped_Jpeg* jpeg)
 {
     munmap(jpeg->data, jpeg->length);
+    free(jpeg->filename);
     free(jpeg);
 }
 
@@ -146,9 +159,16 @@ struct Frame_Buffer* frame_buffer_create(int fd_drm, uint32_t width, uint32_t he
         .bpp = 32
     };
 
+    struct Frame_Buffer* fb = malloc(sizeof(struct Frame_Buffer));
+    if (fb == 0) {
+        fprintf(stderr, "Out of memory at line %i.\n", __LINE__);
+        return 0;
+    }
+
     int err = ioctl(fd_drm, DRM_IOCTL_MODE_CREATE_DUMB, &arg);
     if (err) {
         perror("ioctl(DRM_IOCTL_MODE_CREATE_DUMB)");
+        free(fb);
         return 0;
     }
 
@@ -158,10 +178,10 @@ struct Frame_Buffer* frame_buffer_create(int fd_drm, uint32_t width, uint32_t he
     if (err) {
         perror("drmModeAddFB()");
         destroy_dumb_buffer(fd_drm, arg.handle);
+        free(fb);
         return 0;
     }
 
-    struct Frame_Buffer* fb = malloc(sizeof(struct Frame_Buffer));
     fb->fd_drm = fd_drm;
     fb->width = width;
     fb->height = height;
@@ -271,11 +291,136 @@ void memset32(uint32_t* buf, uint32_t color, size_t n) {
 // Background color for border around jpegs.
 uint32_t BG_Color = 0;
 
-// Decode a jpeg into a frame buffer.
-// Uses turbojpeg scale factor to resize the image to fit the fb.
-// Only discrete scaling factors allowed: 1/8 - 2x, in multiples of 1/8.
+// How to get an arbitrary size jpeg onto a fixed size screen.
+// We have 2 scaling methods:
+//  1) jpeg scaled decode: 1x, 1/2, 1/4, 1/8
+//  2) stbir_resize() general-purpose image resizer
+// If possible, we try to decode the jpeg directly to the framebuffer and avoid
+// doing an unnecessary resize.
+struct resize_strategy {
+    // jpeg native size
+    int src_width;
+    int src_height;
+
+    // screen / framebuffer size
+    int dst_width;
+    int dst_height;
+
+    // jpeg decode size
+    // src scaled by 1x, 1/2, 1/4, 1/8
+    int decode_width;
+    int decode_height;
+
+    // use stbir_resize to scale decode size to screen size
+    // will be 0 if decode size matches a screen dimension (resize not needed)
+    int resize_width;
+    int resize_height;
+
+    // borders because jpeg aspect ratio may differ from screen
+    int border_left;
+    int border_right;
+    int border_top;
+    int border_bottom;
+};
+
+// Allocate extra pixels to two borders.
+void split_border(int extra, int* left, int* right)
+{
+    int half = extra >> 1;
+    *left = half;
+    *right = extra - half;
+}
+
+void make_resize_strategy(struct resize_strategy* strat,
+    int src_w, int src_h, int dst_w, int dst_h)
+{
+    strat->src_width = src_w;
+    strat->src_height = src_h;
+
+    strat->dst_width = dst_w;
+    strat->dst_height = dst_h;
+
+    strat->decode_width = src_w;
+    strat->decode_height = src_h;
+
+    strat->resize_width = 0;
+    strat->resize_height = 0;
+
+    strat->border_top = 0;
+    strat->border_bottom = 0;
+    strat->border_left = 0;
+    strat->border_right = 0;
+
+    if (src_w == dst_w && src_h == dst_h) {
+        // best case, jpeg matches screen exactly
+        return;
+    }
+
+    int scale_w;
+    int scale_h;
+
+    tjscalingfactor sf = { 1 };
+    for (sf.denom = 1; sf.denom <= 8; sf.denom <<= 1) {
+        // check if we can do a scaled decode directly to framebuffer
+        scale_w = TJSCALED(src_w, sf);
+        scale_h = TJSCALED(src_h, sf);
+        if (scale_w == dst_w && scale_h < dst_h) {
+            // direct decode to framebuffer, borders on top/bottom
+            strat->decode_width = scale_w;
+            strat->decode_height = scale_h;
+            split_border(dst_h - scale_h,
+                &strat->border_top, &strat->border_bottom);
+            return;
+        }
+        if (scale_w < dst_w && scale_h == dst_h) {
+            // direct decode to framebuffer, borders on left/right
+            strat->decode_width = scale_w;
+            strat->decode_height = scale_h;
+            split_border(dst_w - scale_w,
+                &strat->border_left, &strat->border_right);
+            return;
+        }
+    }
+
+    // no exact decode, pick smallest decode size that is larger than screen
+    for (sf.denom = 8; sf.denom >= 1; sf.denom >>= 1) {
+        scale_w = TJSCALED(src_w, sf);
+        scale_h = TJSCALED(src_h, sf);
+        if (scale_w > dst_w || scale_h > dst_h) {
+            // good intermediate size
+            break;
+        }
+    }
+
+    // temp image will be this size
+    strat->decode_width = scale_w;
+    strat->decode_height = scale_h;
+
+    // set borders to preserve aspect ratio
+    if (scale_w * dst_h > scale_h * dst_w) {
+        // borders on top / bottom
+        strat->resize_width = dst_w;
+        strat->resize_height = scale_h * dst_w / scale_w;
+        split_border(abs(strat->resize_height - dst_h),
+            &strat->border_top, &strat->border_bottom);
+    }
+    else {
+        // borders on left / right
+        strat->resize_width = scale_w * dst_h / scale_h;
+        strat->resize_height = dst_h;
+        split_border(abs(strat->resize_width - dst_w),
+            &strat->border_left, &strat->border_right);
+    }
+}
+
 int jpeg_decode(struct Mapped_Jpeg* jpeg, struct Frame_Buffer* fb)
 {
+    double t0 = time_f();
+    bool trace_resize = false;
+    if (trace_resize) {
+        fprintf(stderr, "\nJpeg %s\n", jpeg->filename);
+    }
+
     tjhandle inst = tjInitDecompress();
     if (inst == 0) {
         fprintf(stderr, "jpeg init: %s\n", tjGetErrorStr2(0));
@@ -292,132 +437,113 @@ int jpeg_decode(struct Mapped_Jpeg* jpeg, struct Frame_Buffer* fb)
         return -1;
     }
 
-    const bool trace_scale = false;
-    if (trace_scale) fprintf(stderr, "jpeg: %ix%i\n", jpeg_width, jpeg_height);
+    struct resize_strategy strat;
+    make_resize_strategy(&strat, jpeg_width, jpeg_height,
+        fb->width, fb->height);
 
-    // Find largest scaling factor for result <= display size.
-    int scaled_width = jpeg_width;
-    int scaled_height = jpeg_height;
-    bool too_big = jpeg_width > fb->width || jpeg_height > fb->height;
-    int sf_n;
-    tjscalingfactor* sf = tjGetScalingFactors(&sf_n);
-    if (sf && sf_n > 0) {
-        int i;
-        for (i = 0; i < sf_n; i++) {
-            if (trace_scale) fprintf(stderr, "scale %i/%i", sf[i].num, sf[i].denom);
-            int sf_w = TJSCALED(jpeg_width, sf[i]);
-            int sf_h = TJSCALED(jpeg_height, sf[i]);
-            if (too_big) {
-                // need to shrink
-                if (sf_w < scaled_width || sf_h < scaled_height) {
-                    // smaller than previous
-                    scaled_width = sf_w;
-                    scaled_height = sf_h;
-                    if (trace_scale) fprintf(stderr, " -");
-                    if (scaled_width <= fb->width && scaled_height <= fb->height) {
-                        too_big = false;
-                    }
-                }
-            }
-            else {
-                // need to enlarge
-                if (sf_w <= fb->width && sf_h <= fb->height) {
-                    // scaled <= screen size
-                    if (sf_w > scaled_width || sf_h > scaled_height) {
-                        // larger than previous
-                        scaled_width = sf_w;
-                        scaled_height = sf_h;
-                        if (trace_scale) fprintf(stderr, " +");
-                    }
-                }
-            }
-            if (trace_scale) fprintf(stderr, "\n");
-        }
+    if (trace_resize) {
+        fprintf(stderr, "  src %5i x %5i\n", strat.src_width, strat.src_height);
+        fprintf(stderr, "  dec %5i x %5i\n", strat.decode_width, strat.decode_height);
+        fprintf(stderr, "  rsz %5i x %5i\n", strat.resize_width, strat.resize_height);
+        fprintf(stderr, "  dst %5i x %5i\n", strat.dst_width, strat.dst_height);
+        fprintf(stderr, "  border %i %i %i %i\n", strat.border_left, strat.border_right,
+             strat.border_top, strat.border_bottom);
     }
 
-    if (too_big) {
-        fprintf(stderr, "jpeg image too large.\n");
-        tjDestroy(inst);
-        return -1;
-    }
-
-    // Borders, if scaled image is less than screen size.
-    int blank_top = 0;
-    int blank_bottom = 0;
-    if (fb->height > scaled_height) {
-        int delta = fb->height - scaled_height;
-        blank_top = delta >> 1;
-        blank_bottom = delta - blank_top;
-    }
-
-    int blank_left = 0;
-    int blank_right = 0;
-    if (fb->width > scaled_width) {
-        int delta = fb->width - scaled_width;
-        blank_left = delta >> 1;
-        blank_right = delta - blank_left;
-    }
-
-    uint32_t* pixels = fb->pixels;
-
-    if (trace_scale) {
-        fprintf(stderr, "fb->width   %4i\n", fb->width);
-        fprintf(stderr, "fb->height  %4i\n", fb->height);
-        fprintf(stderr, "fb->pitch   %4i\n", fb->pitch);
-        fprintf(stderr, "fb->size    %4i\n", fb->size);
-        fprintf(stderr, "fb->pitch32 %4i\n", fb->pitch32);
-        fprintf(stderr, "fb->size32  %4i\n", fb->size32);
-        fprintf(stderr, "\n");
-        fprintf(stderr, "scaled_width  %4i\n", scaled_width);
-        fprintf(stderr, "scaled_height %4i\n", scaled_height);
-        fprintf(stderr, "blank_left    %4i\n", blank_left);
-        fprintf(stderr, "blank_right   %4i\n", blank_right);
-        fprintf(stderr, "blank_top     %4i\n", blank_top);
-        fprintf(stderr, "blank_bottom  %4i\n", blank_bottom);
-    }
+    uint32_t* pixels = (uint32_t*)fb->pixels;
 
     // top border + left border of first row
-    int blank = blank_top * fb->width + blank_left;
-    memset32(pixels, BG_Color, blank);
-    pixels += blank;
+    int border = strat.border_top * fb->pitch32 + strat.border_left;
+    memset32(pixels, BG_Color, border);
+    pixels += border;
 
-    // the jpeg
-    err = tjDecompress2(inst, jpeg->data, jpeg->length,
-            (unsigned char*)pixels, scaled_width, fb->pitch, scaled_height,
-            TJPF_BGRX, 0);
-    if (err < 0) {
-        fprintf(stderr, "jpeg decompress: %s\n", tjGetErrorStr2(inst));
-        tjDestroy(inst);
-        return -1;
-    }
+    int border_height = 0;
 
-    int pitch32 = fb->pitch / sizeof(*pixels);
-    if (blank_left == 0 && blank_right == 0) {
-        // special case no left/right borders
-        pixels += pitch32 * scaled_height;
-    }
-    else {
-        int blank_line = blank_right + blank_left;
-        int i;
-        for (i = 0; i < scaled_height - 1; i++) {
-            // right border of current row + left border of next row
-            memset32(pixels + scaled_width, BG_Color, blank_line);
-            pixels += pitch32;
+    if (strat.resize_width) {
+        size_t temp_size = strat.decode_width * strat.decode_height * 4;
+        void* temp = malloc(temp_size);
+        if (temp == 0) {
+            fprintf(stderr, "Malloc(%i MB) failed during of 2-step resize.\n",
+                (int)(temp_size >> 20));
+            tjDestroy(inst);
+            return -1;
         }
 
-        // right border of last row
-        memset32(pixels + scaled_width, BG_Color, blank_right);
-        pixels += scaled_width + blank_right;
+        err = tjDecompress2(inst, jpeg->data, jpeg->length,
+                temp, strat.decode_width, strat.decode_width * 4,
+                strat.decode_height, TJPF_BGRX, 0);
+        if (err < 0) {
+            fprintf(stderr, "jpeg decompress: %s\n", tjGetErrorStr2(inst));
+            free(temp);
+            tjDestroy(inst);
+            return -1;
+        }
+
+        double t1 = time_f();
+
+        stbir_resize_uint8_linear(temp, strat.decode_width , strat.decode_height,
+            strat.decode_width * 4, (uint8_t*)pixels, strat.resize_width,
+            strat.resize_height, fb->pitch, STBIR_4CHANNEL);
+
+        double t2 = time_f();
+
+        if (trace_resize) {
+            fprintf(stderr, "  jpeg:   %5.3f\n", t1 - t0);
+            fprintf(stderr, "  resize: %5.3f\n", t2 - t1);
+        }
+
+        pixels += strat.resize_width;
+        border_height = strat.resize_height;
+
+        free(temp);
+        tjDestroy(inst);
+    }
+    else {
+        err = tjDecompress2(inst, jpeg->data, jpeg->length, (uint8_t*)pixels,
+            strat.decode_width, fb->pitch, strat.decode_height, TJPF_BGRX, 0);
+        if (err < 0) {
+            fprintf(stderr, "jpeg decompress: %s\n", tjGetErrorStr2(inst));
+            tjDestroy(inst);
+            return -1;
+        }
+
+        double t1 = time_f();
+
+        if (trace_resize) {
+            fprintf(stderr, "  jpeg:   %5.3f\n", t1 - t0);
+        }
+
+        pixels += strat.decode_width;
+        border_height = strat.decode_height;
+
+        tjDestroy(inst);
     }
 
-    // bottom border
-    memset32(pixels, BG_Color, blank_bottom * fb->width);
+    // right border of current row + left border of next row
+    border = strat.border_left + strat.border_right;
+    if (border) {
+        int i;
+        for (i = 0; i < border_height - 1; i++) {
+            memset32(pixels, BG_Color, border);
+            pixels += fb->pitch32;
+        }
+    }
+    else {
+        // no left or right border
+        pixels += fb->pitch32 * (border_height - 1);
+    }
 
-    tjDestroy(inst);
+    // right border of last row + bottom border
+    border = strat.border_right + strat.border_bottom * fb->pitch32;
+    memset32(pixels, BG_Color, border);
+
+    if (trace_resize) {
+        double t_total = time_f() - t0;
+        fprintf(stderr, "  total:  %5.3f\n", t_total);
+    }
 
     return 0;
 }
-
 
 
 // Graphics cards, connectors, and displays.

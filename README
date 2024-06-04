@@ -17,6 +17,7 @@ Requires:
     libdrm-dev
     libturbojpeg0-dev
 
+Builds with gcc or clang. Optimized SIMD code on arm, aarch64, and x86-64.
 
 Major goals for development were simplicity, few dependencies, and easy
 integration with shell scripts and other command line tools.
@@ -94,6 +95,31 @@ sleep
 
 
 
+Large Images
+============
+Console-jpeg can use a lot of memory for large images. A 10 megapixel
+progressive jpeg may require 100 MB of RAM to decode, resize, and display.
+
+On the other hand, very large non-progressive jpegs can be decoded and resized
+without ever constructing the full resolution raw image. For example, a 505 MP
+31,800 x 15,900 jpeg can be decoded at 1/8 scale to 3,975 x 1,988, then
+resized to 1920 x 960 for display. For a non-progressive jpeg, this takes less
+than 100 MB of RAM and executes in 9 seconds on a Raspberry Pi 2 W.
+
+If you give console-jpeg a very large jpeg, it may try to allocate more memory
+than is available (esp on a 512MB RPI Zero). If the allocation fails,
+console-jpeg will report the error. But the allocation may not fail, and
+Raspberry OS might decide to start swapping to a microSD card. This is very
+bad for system performance (and not great for the sd card). You may need to
+power-cycle your Pi to recover control.
+
+The solution is to use prlimit to restrict console-jpeg's resource usage:
+$ prlimit -d=100000000 ./console-jpeg test.jpg
+
+This command limits console-jpeg to 100 MB of RAM, which is enough to decode
+most jpegs. Tune the value to suit your images and hardware.
+
+
 
 Recipes & Examples
 ==================
@@ -115,7 +141,8 @@ Same slideshow, but the script uses sleep for pacing:
 Zoneminder camera snapshot every ~5 secs:
     ZM_URL="http://192.168.1.1/cgi-bin/nph-zms?mode=single&monitor=1"
     ZM_PIC="/tmp/zm-pic.jpg"
-    (curl -so "$ZM_PIC" "$ZM_URL"; echo "$ZM_PIC"; sleep 5) | console-jpeg
+    (while curl -sSo "$ZM_PIC" "$ZM_URL"; do echo "$ZM_PIC"; sleep 5; done) \
+        | console-jpeg
 
 
 Put the display to sleep for 10 seconds:
