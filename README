@@ -138,6 +138,10 @@ Same slideshow, but the script uses sleep for pacing:
     (for x in *.jpg; do echo "$x"; sleep 5; done) | console-jpeg
 
 
+Press enter to show the next image:
+    (for x in *.jpg; do echo "$x"; read; done) | ./console-jpeg
+
+
 Zoneminder camera snapshot every ~5 secs:
     ZM_URL="http://192.168.1.1/cgi-bin/nph-zms?mode=single&monitor=1"
     ZM_PIC="/tmp/zm-pic.jpg"
@@ -147,6 +151,28 @@ Zoneminder camera snapshot every ~5 secs:
 
 Put the display to sleep for 10 seconds:
     console-jpeg sleep wait:10 exit
+
+
+Display PDFs 2-up and anti-aliased using pdfjam and ghostscript
+---------------------------------------------------------------
+
+Requires:
+    ghostscript
+    texlive-extra-utils
+
+sudo apt install ghostscript texlive-extra-utils
+
+# Select pages 17 and 18. Set papersize to display res/10 mm (254 dpi)
+# e.g. 1920x1200 -> '{192mm,120mm}'
+pdfjam ltc3309a.pdf '17,18' --nup 2x1 --papersize '{192mm,120mm}' \
+    --outfile out.pdf
+
+# Render at 2x dpi, so that console-jpeg will do a 2:1 shrink, which looks
+# slightly better than ghostscript's alphaBits=4 output, imo.
+gs -dSAFER -dBATCH -dNOPAUSE -sDEVICE=png16m -r508 -dTextAlphaBits=4 \
+        -dGraphicsAlphaBits=4 -sOutputFile=out.png out.pdf
+
+console-jpeg out.png
 
 
 
