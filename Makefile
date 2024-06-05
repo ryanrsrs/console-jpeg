@@ -1,5 +1,5 @@
 CFLAGS=-std=gnu11 -Wall -I/usr/include/libdrm -march=native -Os -DSTBIR_USE_FMA
-LDFLAGS=-lturbojpeg -ldrm -lm
+LDLIBS=-lm -ldrm -lturbojpeg -lheif -lspng
 
 # https://stackoverflow.com/questions/45125516/possible-values-for-uname-m#45125525
 # Use sed to gather up arm32 and arm64 synonyms.
@@ -25,14 +25,16 @@ else
 	# weirdo arch
 endif
 
-console-jpeg : console-jpeg.o stb_impl.o
-	$(CC) -o console-jpeg console-jpeg.o stb_impl.o $(LDFLAGS)
+OBJS=console-jpeg.o stb_impl.o frame_buffer.o util.o read_jpeg.o read_heif.o read_png.o
 
-console-jpeg.o : console-jpeg.c stb_image_resize2.h
-	$(CC) $(CFLAGS) -c console-jpeg.c
+console-jpeg : $(OBJS)
+	$(CC) -o $@ $(OBJS) $(LDLIBS)
+
+%.o : %.c %.h frame_buffer.h util.h
+	$(CC) $(CFLAGS) -c $<
 
 stb_impl.o : stb_impl.c stb_image_resize2.h
-	$(CC) $(CFLAGS) -Wno-unused-function -c stb_impl.c
+	$(CC) $(CFLAGS) -Wno-unused-function -c $<
 
 clean :
-	rm -f console-jpeg console-jpeg.o stb_impl.o
+	rm -f console-jpeg $(OBJS)

@@ -15,228 +15,16 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <turbojpeg.h>
-
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include <drm_fourcc.h>
 
-#include "stb_image_resize2.h"
+#include "frame_buffer.h"
+#include "util.h"
 
-volatile bool Quit = false;
-
-void ctrl_c_handler(int signum)
-{
-    Quit = true;
-}
-
-// Return floating point seconds since first call
-// First call always returns 0.0
-double time_f()
-{
-    static struct timespec ts_zero = { 0, 0 };
-
-    if (ts_zero.tv_sec == 0 && ts_zero.tv_nsec == 0) {
-        clock_gettime(CLOCK_MONOTONIC, &ts_zero);
-        return 0.0;
-    }
-
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    double f = (ts.tv_nsec - ts_zero.tv_nsec) * 1e-9;
-    f += ts.tv_sec - ts_zero.tv_sec;
-    return f;
-}
-
-void sleep_f(double secs)
-{
-    uint64_t ns = secs * 1e9;
-    struct timespec rem;
-    rem.tv_sec  = ns / 1000000000ULL;
-    rem.tv_nsec = ns % 1000000000ULL;
-    while (nanosleep(&rem, &rem)) {
-        if (errno != EINTR) break;
-        if (Quit) break; // caught ctrl-c
-        // else ignore interrupted system call
-    }
-}
-
-// Memory-mapped jpeg file.
-struct Mapped_Jpeg {
-    char* filename;
-    unsigned char* data;
-    size_t length;
-};
-
-struct Mapped_Jpeg* jpeg_create(const char* filename)
-{
-    int fd = open(filename, O_RDONLY);
-    if (fd < 0) {
-        perror("open(jpeg)");
-        return 0;
-    }
-
-    struct stat st;
-    int err = fstat(fd, &st);
-    if (err < 0) {
-        perror("fstat(jpeg)");
-        close(fd);
-        return 0;
-    }
-
-    // very arbitrary limit
-    if ((st.st_size >> 20) > 500) {
-        fprintf(stderr, "Input jpeg larger than 500 MB.\n");
-        close(fd);
-        return 0;
-    }
-
-    void* addr = mmap(0, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (addr == MAP_FAILED) {
-        perror("mmap(jpeg)");
-        close(fd);
-        return 0;
-    }
-
-    close(fd);
-
-    struct Mapped_Jpeg* jpeg = malloc(sizeof(struct Mapped_Jpeg));
-    char* name = strdup(filename);
-    if (jpeg == 0 || name == 0) {
-        free(jpeg);
-        free(name);
-        munmap(addr, st.st_size);
-        fprintf(stderr, "Out of memory at line %i.\n", __LINE__);
-        return 0;
-    }
-    jpeg->filename = name;
-    jpeg->data = (unsigned char*)addr;
-    jpeg->length = st.st_size;
-    return jpeg;
-}
-
-void jpeg_destroy(struct Mapped_Jpeg* jpeg)
-{
-    munmap(jpeg->data, jpeg->length);
-    free(jpeg->filename);
-    free(jpeg);
-}
-
-
-struct Frame_Buffer {
-    int fd_drm;
-
-    uint32_t width;
-    uint32_t height;
-    uint32_t pitch;
-    uint32_t size;
-
-    // divided by 4
-    uint32_t pitch32;
-    uint32_t size32;
-
-    // dumb buffer
-    drm_handle_t handle;
-
-    // frame buffer
-    uint32_t fb_id;
-
-    // mmap
-    int fd_dma;
-    void* pixels;
-};
-
-void destroy_dumb_buffer(int fd_drm, drm_handle_t handle)
-{
-    struct drm_mode_destroy_dumb arg = { .handle = handle };
-    ioctl(fd_drm, DRM_IOCTL_MODE_DESTROY_DUMB, &arg);
-}
-
-struct Frame_Buffer* frame_buffer_create(int fd_drm, uint32_t width, uint32_t height)
-{
-    struct drm_mode_create_dumb arg = {
-        .height = height,
-        .width = width,
-        .bpp = 32
-    };
-
-    struct Frame_Buffer* fb = malloc(sizeof(struct Frame_Buffer));
-    if (fb == 0) {
-        fprintf(stderr, "Out of memory at line %i.\n", __LINE__);
-        return 0;
-    }
-
-    int err = ioctl(fd_drm, DRM_IOCTL_MODE_CREATE_DUMB, &arg);
-    if (err) {
-        perror("ioctl(DRM_IOCTL_MODE_CREATE_DUMB)");
-        free(fb);
-        return 0;
-    }
-
-    uint32_t fb_id;
-    err = drmModeAddFB(fd_drm, width, height, 24, 32,
-            arg.pitch, arg.handle, &fb_id);
-    if (err) {
-        perror("drmModeAddFB()");
-        destroy_dumb_buffer(fd_drm, arg.handle);
-        free(fb);
-        return 0;
-    }
-
-    fb->fd_drm = fd_drm;
-    fb->width = width;
-    fb->height = height;
-    fb->pitch = arg.pitch;
-    fb->size = arg.size;
-    fb->pitch32 = fb->pitch / sizeof(uint32_t);
-    fb->size32 = fb->size / sizeof(uint32_t);
-    fb->handle = arg.handle;
-    fb->fb_id = fb_id;
-    fb->fd_dma = -1;
-    fb->pixels = 0;
-
-    return fb;
-}
-
-void frame_buffer_unmap(struct Frame_Buffer* fb)
-{
-    munmap(fb->pixels, fb->size);
-    close(fb->fd_dma);
-    fb->pixels = 0;
-    fb->fd_dma = -1;
-}
-
-void frame_buffer_destroy(struct Frame_Buffer* fb)
-{
-    if (fb->pixels) {
-        frame_buffer_unmap(fb);
-    }
-    drmModeRmFB(fb->fd_drm, fb->fb_id);
-    destroy_dumb_buffer(fb->fd_drm, fb->handle);
-    free(fb);
-}
-
-int frame_buffer_map(struct Frame_Buffer* fb)
-{
-    int err = drmPrimeHandleToFD(fb->fd_drm, fb->handle,
-            DRM_CLOEXEC | DRM_RDWR, &fb->fd_dma);
-    if (err || fb->fd_dma < 0) {
-        perror("drmPrimeHandleToFD()");
-        fb->fd_dma = -1;
-        return -1;
-    }
-
-    void* ptr = mmap(0, fb->size, PROT_READ | PROT_WRITE, MAP_SHARED,
-                    fb->fd_dma, 0);
-    if (ptr == 0 || ptr == MAP_FAILED) {
-        perror("mmap(fd_dma)");
-        close(fb->fd_dma);
-        fb->fd_dma = -1;
-        return -1;
-    }
-    fb->pixels = ptr;
-
-    return 0;
-}
+#include "read_jpeg.h"
+#include "read_heif.h"
+#include "read_png.h"
 
 // Two for double buffering.
 struct Frame_Buffer* FB0 = 0;
@@ -279,272 +67,6 @@ int create_two_frame_buffers(int fd_drm, uint32_t width, uint32_t height)
     }
     return 0;
 }
-
-// Used to fill BGRX frame buffer with a solid RGB color.
-void memset32(uint32_t* buf, uint32_t color, size_t n) {
-    size_t i;
-    for (i = 0; i < n; i++) {
-        buf[i] = color;
-    }
-}
-
-// Background color for border around jpegs.
-uint32_t BG_Color = 0;
-
-// How to get an arbitrary size jpeg onto a fixed size screen.
-// We have 2 scaling methods:
-//  1) jpeg scaled decode: 1x, 1/2, 1/4, 1/8
-//  2) stbir_resize() general-purpose image resizer
-// If possible, we try to decode the jpeg directly to the framebuffer and avoid
-// doing an unnecessary resize.
-struct resize_strategy {
-    // jpeg native size
-    int src_width;
-    int src_height;
-
-    // screen / framebuffer size
-    int dst_width;
-    int dst_height;
-
-    // jpeg decode size
-    // src scaled by 1x, 1/2, 1/4, 1/8
-    int decode_width;
-    int decode_height;
-
-    // use stbir_resize to scale decode size to screen size
-    // will be 0 if decode size matches a screen dimension (resize not needed)
-    int resize_width;
-    int resize_height;
-
-    // borders because jpeg aspect ratio may differ from screen
-    int border_left;
-    int border_right;
-    int border_top;
-    int border_bottom;
-};
-
-// Allocate extra pixels to two borders.
-void split_border(int extra, int* left, int* right)
-{
-    int half = extra >> 1;
-    *left = half;
-    *right = extra - half;
-}
-
-void make_resize_strategy(struct resize_strategy* strat,
-    int src_w, int src_h, int dst_w, int dst_h)
-{
-    strat->src_width = src_w;
-    strat->src_height = src_h;
-
-    strat->dst_width = dst_w;
-    strat->dst_height = dst_h;
-
-    strat->decode_width = src_w;
-    strat->decode_height = src_h;
-
-    strat->resize_width = 0;
-    strat->resize_height = 0;
-
-    strat->border_top = 0;
-    strat->border_bottom = 0;
-    strat->border_left = 0;
-    strat->border_right = 0;
-
-    if (src_w == dst_w && src_h == dst_h) {
-        // best case, jpeg matches screen exactly
-        return;
-    }
-
-    int scale_w;
-    int scale_h;
-
-    tjscalingfactor sf = { 1 };
-    for (sf.denom = 1; sf.denom <= 8; sf.denom <<= 1) {
-        // check if we can do a scaled decode directly to framebuffer
-        scale_w = TJSCALED(src_w, sf);
-        scale_h = TJSCALED(src_h, sf);
-        if (scale_w == dst_w && scale_h < dst_h) {
-            // direct decode to framebuffer, borders on top/bottom
-            strat->decode_width = scale_w;
-            strat->decode_height = scale_h;
-            split_border(dst_h - scale_h,
-                &strat->border_top, &strat->border_bottom);
-            return;
-        }
-        if (scale_w < dst_w && scale_h == dst_h) {
-            // direct decode to framebuffer, borders on left/right
-            strat->decode_width = scale_w;
-            strat->decode_height = scale_h;
-            split_border(dst_w - scale_w,
-                &strat->border_left, &strat->border_right);
-            return;
-        }
-    }
-
-    // no exact decode, pick smallest decode size that is larger than screen
-    for (sf.denom = 8; sf.denom >= 1; sf.denom >>= 1) {
-        scale_w = TJSCALED(src_w, sf);
-        scale_h = TJSCALED(src_h, sf);
-        if (scale_w > dst_w || scale_h > dst_h) {
-            // good intermediate size
-            break;
-        }
-    }
-
-    // temp image will be this size
-    strat->decode_width = scale_w;
-    strat->decode_height = scale_h;
-
-    // set borders to preserve aspect ratio
-    if (scale_w * dst_h > scale_h * dst_w) {
-        // borders on top / bottom
-        strat->resize_width = dst_w;
-        strat->resize_height = scale_h * dst_w / scale_w;
-        split_border(abs(strat->resize_height - dst_h),
-            &strat->border_top, &strat->border_bottom);
-    }
-    else {
-        // borders on left / right
-        strat->resize_width = scale_w * dst_h / scale_h;
-        strat->resize_height = dst_h;
-        split_border(abs(strat->resize_width - dst_w),
-            &strat->border_left, &strat->border_right);
-    }
-}
-
-int jpeg_decode(struct Mapped_Jpeg* jpeg, struct Frame_Buffer* fb)
-{
-    double t0 = time_f();
-    bool trace_resize = false;
-    if (trace_resize) {
-        fprintf(stderr, "\nJpeg %s\n", jpeg->filename);
-    }
-
-    tjhandle inst = tjInitDecompress();
-    if (inst == 0) {
-        fprintf(stderr, "jpeg init: %s\n", tjGetErrorStr2(0));
-        return -1;
-    }
-
-    // Read jpeg header
-    int jpeg_width, jpeg_height, subsamp, color;
-    int err = tjDecompressHeader3(inst, jpeg->data, jpeg->length,
-        &jpeg_width, &jpeg_height, &subsamp, &color);
-    if (err < 0) {
-        fprintf(stderr, "jpeg header: %s\n", tjGetErrorStr2(inst));
-        tjDestroy(inst);
-        return -1;
-    }
-
-    struct resize_strategy strat;
-    make_resize_strategy(&strat, jpeg_width, jpeg_height,
-        fb->width, fb->height);
-
-    if (trace_resize) {
-        fprintf(stderr, "  src %5i x %5i\n", strat.src_width, strat.src_height);
-        fprintf(stderr, "  dec %5i x %5i\n", strat.decode_width, strat.decode_height);
-        fprintf(stderr, "  rsz %5i x %5i\n", strat.resize_width, strat.resize_height);
-        fprintf(stderr, "  dst %5i x %5i\n", strat.dst_width, strat.dst_height);
-        fprintf(stderr, "  border %i %i %i %i\n", strat.border_left, strat.border_right,
-             strat.border_top, strat.border_bottom);
-    }
-
-    uint32_t* pixels = (uint32_t*)fb->pixels;
-
-    // top border + left border of first row
-    int border = strat.border_top * fb->pitch32 + strat.border_left;
-    memset32(pixels, BG_Color, border);
-    pixels += border;
-
-    int border_height = 0;
-
-    if (strat.resize_width) {
-        size_t temp_size = strat.decode_width * strat.decode_height * 4;
-        void* temp = malloc(temp_size);
-        if (temp == 0) {
-            fprintf(stderr, "Malloc(%i MB) failed during of 2-step resize.\n",
-                (int)(temp_size >> 20));
-            tjDestroy(inst);
-            return -1;
-        }
-
-        err = tjDecompress2(inst, jpeg->data, jpeg->length,
-                temp, strat.decode_width, strat.decode_width * 4,
-                strat.decode_height, TJPF_BGRX, 0);
-        if (err < 0) {
-            fprintf(stderr, "jpeg decompress: %s\n", tjGetErrorStr2(inst));
-            free(temp);
-            tjDestroy(inst);
-            return -1;
-        }
-
-        double t1 = time_f();
-
-        stbir_resize_uint8_linear(temp, strat.decode_width , strat.decode_height,
-            strat.decode_width * 4, (uint8_t*)pixels, strat.resize_width,
-            strat.resize_height, fb->pitch, STBIR_4CHANNEL);
-
-        double t2 = time_f();
-
-        if (trace_resize) {
-            fprintf(stderr, "  jpeg:   %5.3f\n", t1 - t0);
-            fprintf(stderr, "  resize: %5.3f\n", t2 - t1);
-        }
-
-        pixels += strat.resize_width;
-        border_height = strat.resize_height;
-
-        free(temp);
-        tjDestroy(inst);
-    }
-    else {
-        err = tjDecompress2(inst, jpeg->data, jpeg->length, (uint8_t*)pixels,
-            strat.decode_width, fb->pitch, strat.decode_height, TJPF_BGRX, 0);
-        if (err < 0) {
-            fprintf(stderr, "jpeg decompress: %s\n", tjGetErrorStr2(inst));
-            tjDestroy(inst);
-            return -1;
-        }
-
-        double t1 = time_f();
-
-        if (trace_resize) {
-            fprintf(stderr, "  jpeg:   %5.3f\n", t1 - t0);
-        }
-
-        pixels += strat.decode_width;
-        border_height = strat.decode_height;
-
-        tjDestroy(inst);
-    }
-
-    // right border of current row + left border of next row
-    border = strat.border_left + strat.border_right;
-    if (border) {
-        int i;
-        for (i = 0; i < border_height - 1; i++) {
-            memset32(pixels, BG_Color, border);
-            pixels += fb->pitch32;
-        }
-    }
-    else {
-        // no left or right border
-        pixels += fb->pitch32 * (border_height - 1);
-    }
-
-    // right border of last row + bottom border
-    border = strat.border_right + strat.border_bottom * fb->pitch32;
-    memset32(pixels, BG_Color, border);
-
-    if (trace_resize) {
-        double t_total = time_f() - t0;
-        fprintf(stderr, "  total:  %5.3f\n", t_total);
-    }
-
-    return 0;
-}
-
 
 // Graphics cards, connectors, and displays.
 // How to enumerate them, present them to the user, and pick one.
@@ -833,6 +355,26 @@ const char* match_prefix(const char* s, const char* prefix)
     return 0;
 }
 
+bool match_case_suffix_list(const char* s, ...)
+{
+    const char* p = strrchr(s, '/');
+    if (p == 0) p = s;
+    p = strrchr(p, '.');
+    if (p == 0) return false;
+
+    bool match;
+    va_list args;
+    va_start(args, s);
+    do {
+        const char* suffix = va_arg(args, const char*);
+        if (suffix == 0) break;
+        match = !strcasecmp(p, suffix);
+    } while (!match);
+
+    va_end(args);
+    return match;
+}
+
 void print_usage(const char* fmt, ...)
 {
     FILE* out = stderr;
@@ -856,7 +398,9 @@ void print_usage(const char* fmt, ...)
     fprintf(out, "black          Fill screen with black.\n");
     fprintf(out, "white          Fill screen with white.\n");
     fprintf(out, "jpeg:file.jpg  Display a jpeg on the screen.\n");
-    fprintf(out, "file.jpg       You can skip the jpeg: prefix.\n");
+    fprintf(out, "heif:file.heic Display a heif on the screen.\n");
+    fprintf(out, "png:file.png   Display a png on the screen.\n");
+    fprintf(out, "file.jpg       No prefix, determine type from extension.\n");
     fprintf(out, "wait:1.23      Pause x seconds.\n");
     fprintf(out, "halt           Stop forever (Ctrl-C to quit).\n");
     fprintf(out, "exit           Quit program.\n");
@@ -864,7 +408,7 @@ void print_usage(const char* fmt, ...)
     fprintf(out, "\n");
     fprintf(out, "After processing command line arguments, console-jpeg\n");
     fprintf(out, "reads further commands from stdin. Use a shell script\n");
-    fprintf(out, "to pass in jpeg filenames for display. Make sure the\n");
+    fprintf(out, "to pass in image filenames for display. Make sure the\n");
     fprintf(out, "output of the command-generating program is line buffered.\n");
     fprintf(out, "\n");
     fprintf(out, "On the Raspberry Pi 4, console-jpeg automatically picks\n");
@@ -968,13 +512,13 @@ int main(int argc, const char* argv[])
         if (*command == 0) continue;
 
         if (!strcmp(command, "black")) {
-            memset32((uint32_t*)FB0->pixels, 0, FB0->size32);
+            fill_rect(FB0, 0x000000, 0, 0, -1, -1);
         }
         else if (!strcmp(command, "white")) {
-            memset32((uint32_t*)FB0->pixels, 0xffffff, FB0->size32);
+            fill_rect(FB0, 0xffffff, 0, 0, -1, -1);
         }
         else if (!strcmp(command, "clear")) {
-            memset32((uint32_t*)FB0->pixels, BG_Color, FB0->size32);
+            fill_rect(FB0, BG_Color, 0, 0, -1, -1);
         }
         else if ((arg = match_prefix(command, "wait:"))) {
             // pause for x.x seconds
@@ -1007,20 +551,58 @@ int main(int argc, const char* argv[])
             break;
         }
         else {
-            const char* filename;
+            // An image file.
+            enum {
+                FMT_JPEG,
+                FMT_HEIF,
+                FMT_PNG
+            } fmt;
+            const char* filename = 0;
+
             if ((arg = match_prefix(command, "jpeg:"))) {
+                fmt = FMT_JPEG;
                 filename = arg;
             }
-            else {
-                // plain filename, no explicit "jpeg:"
+            else if ((arg = match_prefix(command, "heif:"))) {
+                fmt = FMT_HEIF;
+                filename = arg;
+            }
+            else if ((arg = match_prefix(command, "png:"))) {
+                fmt = FMT_PNG;
+                filename = arg;
+            }
+            else if (match_case_suffix_list(command, ".jpg", ".jpeg", 0)) {
+                fmt = FMT_JPEG;
                 filename = command;
             }
+            else if (match_case_suffix_list(command, ".heif", ".heic", 0)) {
+                fmt = FMT_HEIF;
+                filename = command;
+            }
+            else if (match_case_suffix_list(command, ".png", 0)) {
+                fmt = FMT_PNG;
+                filename = command;
+            }
+            else {
+                fprintf(stderr, "Unknown image file type: %s\n", command);
+                continue;
+            }
 
-            struct Mapped_Jpeg* jpeg = jpeg_create(filename);
-            if (jpeg == 0) continue; // bad filename or corrupt image
-            err = jpeg_decode(jpeg, FB0);
-            jpeg_destroy(jpeg);
-            if (err) continue;
+            if (fmt == FMT_JPEG) {
+                if (read_jpeg(filename, FB0)) {
+                    continue;
+                }
+            }
+            else if (fmt == FMT_HEIF) {
+                if (read_heif(filename, FB0)) {
+                    continue;
+                }
+            }
+            else if (fmt == FMT_PNG) {
+                if (read_png(filename, FB0)) {
+                    continue;
+                }
+            }
         }
 
         if (first_flip) {
@@ -1073,5 +655,6 @@ Cleanup:
             saved_crtc->buffer_id, saved_crtc->x, saved_crtc->y,
             &My_Conn->drm_conn->connector_id, 1, &saved_crtc->mode);
     }
+
     return ret;
 }
