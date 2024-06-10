@@ -9,7 +9,7 @@ such as a login prompt or a bunch of printks. Console-jpeg never leaves an
 image on the screen after it exits.
 
 Capabilities:
- - Show a jpeg on the screen.
+ - Show an image on the screen.
  - Fill the screen with a solid color.
  - Sleep/wake the display on command.
 
@@ -38,8 +38,11 @@ Usage:
 
 Options:
 
---list
+-l, --list
     List all available outputs. Pass the output number to --out=N.
+
+-v, --verbose
+    Print details about image dimensions and performance timing.
 
 --dev=/dev/dri/card1
     Specify device (rarely needed!)
@@ -81,6 +84,18 @@ filename.jpg
     that gives an image <= the screen size. Any remaining border around the
     image is filled with bgcolor. The "jpeg:" prefix is optional.
 
+heif:pic.heic
+pic.heic
+
+png:pic.png
+pic.png
+    HEIF and PNG files are supported, too.
+
+flip
+    Flip the double buffers without drawing anything. This lets you quickly
+    go back and forth between the last two images, without decoding the files
+    again. Good for A/B image comparisons.
+
 wait:1.5
     Pause this many seconds.
 
@@ -116,11 +131,13 @@ bad for system performance (and not great for the sd card). You may need to
 power-cycle your Pi to recover control.
 
 The solution is to use prlimit to restrict console-jpeg's resource usage:
-$ prlimit -d=100000000 ./console-jpeg test.jpg
 
+$ prlimit -d=100000000 ./console-jpeg test.jpg
 This command limits console-jpeg to 100 MB of RAM, which is enough to decode
 most jpegs. Tune the value to suit your images and hardware.
 
+$ prlimit -d=350000000 ./console-jpeg iphone.heic
+350 MB is just enough to decode 45 MP photos from the latest iPhone 15.
 
 
 Recipes & Examples
