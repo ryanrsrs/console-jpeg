@@ -5,14 +5,22 @@
 
 #include <drm_fourcc.h>
 
-#include <libheif/heif.h>
-
 #include "stb_image_resize2.h"
 
 #include "drm_search.h"
 #include "frame_buffer.h"
 #include "util.h"
 #include "read_heif.h"
+
+#ifdef NO_HEIF_SUPPORT
+int read_heif(const char* filename, struct Frame_Buffer* fb)
+{
+    fprintf(File_Error, "Error: console-jpeg was built without HEIF support.\n");
+    return -1;
+}
+#else
+
+#include <libheif/heif.h>
 
 int read_heif(const char* filename, struct Frame_Buffer* fb)
 {
@@ -187,3 +195,5 @@ Cleanup:
 
     return ret;
 }
+
+#endif // NO_HEIF_SUPPORT else

@@ -16,8 +16,10 @@ Capabilities:
 Requires:
     libdrm-dev
     libturbojpeg0-dev
-    libheif-dev
     libspng-dev
+    libheif-dev[*]
+
+* libheif is optional. Uncomment the relevant lines in the Makefile.
 
 Builds with gcc or clang. Optimized SIMD code on arm, aarch64, and x86-64.
 

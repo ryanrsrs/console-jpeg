@@ -4,6 +4,10 @@ LDLIBS=-lm -ldrm -lturbojpeg -lheif -lspng
 # Performance flags, all platforms.
 CFLAGS += -Os -march=native -DSTBIR_USE_FMA
 
+# Disable HEIF support and remove libheif dependency.
+#CFLAGS += -DNO_HEIF_SUPPORT
+#LDLIBS := $(filter-out -lheif,$(LDLIBS))
+
 # https://stackoverflow.com/questions/45125516/possible-values-for-uname-m#45125525
 # Use sed to gather up arm32 and arm64 synonyms.
 ARCH := $(shell uname -m | sed -Ee 's/^(aarch64|armv8).*/aarch64/; s/^arm.*/arm/')
