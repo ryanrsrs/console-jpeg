@@ -43,3 +43,6 @@ stb_impl.o : stb_impl.c stb_image_resize2.h
 
 clean :
 	rm -f console-jpeg $(OBJS)
+
+rsync :
+	rsync -avz "$${USER}@$${SSH_CONNECTION%% *}":console-jpeg/* .

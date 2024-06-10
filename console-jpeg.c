@@ -110,7 +110,8 @@ void print_usage(FILE* out, const char* fmt, ...)
     fprintf(out, "Usage: ./console-jpeg [options] [commands]\n");
     fprintf(out, "\n");
     fprintf(out, "Options:\n");
-    fprintf(out, "--list                List available outputs\n");
+    fprintf(out, "-l, --list            List available outputs\n");
+    fprintf(out, "-v, --verbose         Print details and timing\n");
     fprintf(out, "--dev=/dev/dri/card1  Specify device (rarely needed!)\n");
     fprintf(out, "--out=N               Select output port (from --list)\n");
     fprintf(out, "\n");
@@ -123,6 +124,7 @@ void print_usage(FILE* out, const char* fmt, ...)
     fprintf(out, "heif:file.heic Display a heif on the screen.\n");
     fprintf(out, "png:file.png   Display a png on the screen.\n");
     fprintf(out, "file.jpg       No prefix, determine type from extension.\n");
+    fprintf(out, "flip           Swap buffers without drawing for fast A/B comparison.\n");
     fprintf(out, "wait:1.23      Pause x seconds.\n");
     fprintf(out, "halt           Stop forever (Ctrl-C to quit).\n");
     fprintf(out, "exit           Quit program.\n");
@@ -262,8 +264,7 @@ int main(int argc, const char* argv[])
 
         // skip empty lines
         if (*command == 0) {
-            //continue;
-            command = "flip";
+            continue;
         }
 
         if (!strcmp(command, "black")) {
@@ -293,7 +294,8 @@ int main(int argc, const char* argv[])
             // next jpeg or clear will wake it up
             err = drmModeSetCrtc(My_Card->fd_drm, crtc_id, 0, 0, 0, 0, 0, 0);
             if (err) {
-                perror("drmModeSetCrtc(sleep)");
+                fprintf(File_Error, "Error: drmModeSetCrtc(sleep): %s\n",
+                        strerror(errno));
                 ret = 3;
                 goto Cleanup;
             }
@@ -368,7 +370,8 @@ int main(int argc, const char* argv[])
             err = drmModeSetCrtc(My_Card->fd_drm, crtc_id, FB0->fb_id, 0, 0,
                          &My_Conn->drm_conn->connector_id, 1, mode_info);
             if (err) {
-                perror("drmModeSetCrtc(FB0)");
+                fprintf(File_Error, "Error: drmModeSetCrtc(FB0): %s\n",
+                        strerror(errno));
                 ret = 3;
                 goto Cleanup;
             }
@@ -385,7 +388,8 @@ int main(int argc, const char* argv[])
                 }
                 if (errno != EBUSY) {
                     // a real error
-                    perror("drmModePageFlip(FB0)");
+                    fprintf(File_Error, "Error: drmModePageFlip(FB0): %s\n",
+                            strerror(errno));
                     ret = 3;
                     goto Cleanup;
                 }

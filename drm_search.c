@@ -34,13 +34,14 @@ struct Connector* connector_create(int fd_drm, int conn_ix, uint32_t conn_id)
 {
     drmModeConnector* drm_conn = drmModeGetConnector(fd_drm, conn_id);
     if (drm_conn == 0) {
-        perror("drmModeGetConnector()");
+        fprintf(File_Error, "Error: drmModeGetConnector(): %s\n",
+                strerror(errno));
         return 0;
     }
 
     struct Connector* conn = malloc(sizeof(struct Connector));
     if (conn == 0) {
-        perror("malloc(struct Connector)");
+        fprintf(File_Error, "Error: malloc(struct Connector) failed.\n");
         drmModeFreeConnector(drm_conn);
         return 0;
     }
@@ -111,7 +112,7 @@ struct Card* card_create(const char* dev_path)
 
     struct Card* card = malloc(sizeof(struct Card));
     if (card == 0) {
-        perror("malloc(struct Card)");
+        fprintf(File_Error, "Error: malloc(struct Card) failed.\n");
         drmModeFreeResources(drm_res);
         close(fd_drm);
         return 0;
