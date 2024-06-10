@@ -4371,7 +4371,7 @@ static void stbir__simple_flip_3ch( float * decode_buffer, int width_times_chann
   float STBIR_STREAMOUT_PTR(*) decode = decode_buffer;
   float const * end_decode = decode_buffer + width_times_channels;
 
-  decode += 12;
+  end_decode -= 12;
   while( decode <= end_decode )
   {
     float t0,t1,t2,t3;
@@ -4381,7 +4381,7 @@ static void stbir__simple_flip_3ch( float * decode_buffer, int width_times_chann
     decode[2] = t0; decode[5] = t1; decode[8] = t2; decode[11] = t3;
     decode += 12;
   }
-  decode -= 12;
+  end_decode += 12;
 
   while( decode < end_decode )
   {

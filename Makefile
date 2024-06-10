@@ -1,5 +1,8 @@
-CFLAGS=-std=gnu11 -Wall -I/usr/include/libdrm -march=native -Os -DSTBIR_USE_FMA
+CFLAGS=-std=gnu11 -Wall -I/usr/include/libdrm
 LDLIBS=-lm -ldrm -lturbojpeg -lheif -lspng
+
+# Performance flags, all platforms.
+CFLAGS += -Os -march=native -DSTBIR_USE_FMA
 
 # https://stackoverflow.com/questions/45125516/possible-values-for-uname-m#45125525
 # Use sed to gather up arm32 and arm64 synonyms.
@@ -9,7 +12,8 @@ ARCH := $(shell uname -m | sed -Ee 's/^(aarch64|armv8).*/aarch64/; s/^arm.*/arm/
 IS_GCC := $(shell $(CC) -v 2>&1 | sed -Ene '1p;$$p' | fgrep -cm1 gcc)
 
 # See comment at stb_image_resize2.h:92 "SIMD" re. optimization flags.
-# -march=native automatically uses SSE, AVX, AVX2, F16C, etc if present.
+# -march=native automatically uses SSE, AVX, AVX2, F16C, etc if present on
+# the build machine cpu.
 ifeq "$(ARCH)" "arm"
 	# ARM 32
 	CFLAGS += -mfpu=neon-vfpv4
@@ -25,12 +29,13 @@ else
 	# weirdo arch
 endif
 
-OBJS=console-jpeg.o stb_impl.o frame_buffer.o util.o read_jpeg.o read_heif.o read_png.o
+OBJS=console-jpeg.o stb_impl.o drm_search.o frame_buffer.o util.o \
+	read_jpeg.o read_heif.o read_png.o
 
 console-jpeg : $(OBJS)
 	$(CC) -o $@ $(OBJS) $(LDLIBS)
 
-%.o : %.c %.h frame_buffer.h util.h
+%.o : %.c %.h drm_search.h frame_buffer.h util.h
 	$(CC) $(CFLAGS) -c $<
 
 stb_impl.o : stb_impl.c stb_image_resize2.h

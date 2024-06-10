@@ -1,7 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -15,16 +14,12 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <xf86drm.h>
-#include <xf86drmMode.h>
-#include <drm_fourcc.h>
-
+#include "drm_search.h"
 #include "frame_buffer.h"
-#include "util.h"
-
 #include "read_jpeg.h"
 #include "read_heif.h"
 #include "read_png.h"
+#include "util.h"
 
 // Two for double buffering.
 struct Frame_Buffer* FB0 = 0;
@@ -38,9 +33,10 @@ void swap_frame_buffers()
 }
 
 // Allocate and memory map the two global frame buffes
-int create_two_frame_buffers(int fd_drm, uint32_t width, uint32_t height)
+int create_two_frame_buffers(int fd_drm, uint32_t width, uint32_t height,
+            uint32_t pixel_format)
 {
-    FB0 = frame_buffer_create(fd_drm, width, height);
+    FB0 = frame_buffer_create(fd_drm, width, height, pixel_format);
     if (FB0 == 0) {
         return -1;
     }
@@ -51,7 +47,7 @@ int create_two_frame_buffers(int fd_drm, uint32_t width, uint32_t height)
         return -1;
     }
 
-    FB1 = frame_buffer_create(fd_drm, width, height);
+    FB1 = frame_buffer_create(fd_drm, width, height, pixel_format);
     if (FB1 == 0) {
         frame_buffer_destroy(FB0);
         FB0 = 0;
@@ -66,279 +62,6 @@ int create_two_frame_buffers(int fd_drm, uint32_t width, uint32_t height)
         return -1;
     }
     return 0;
-}
-
-// Graphics cards, connectors, and displays.
-// How to enumerate them, present them to the user, and pick one.
-
-// One connector, e.g. an HDMI port
-struct Connector {
-    STAILQ_ENTRY(Connector) pointers;
-    drmModeConnector* drm_conn;
-    int conn_ix;
-    bool good;
-    int best_mode_ix;
-};
-
-// One graphics card, e.g. /dev/dri/card0
-// each card has a list of connectors.
-struct Card {
-    STAILQ_ENTRY(Card) pointers;
-
-    char* dev_path; // just for printing messages
-    int fd_drm;
-    drmModeRes* drm_res;
-
-    STAILQ_HEAD(Connector_list, Connector) connectors;
-};
-
-// Global list of all cards with frame buffers (no render-only nodes).
-STAILQ_HEAD(Card_list, Card) All_Cards;
-
-
-
-struct Connector* connector_create(int fd_drm, int conn_ix, uint32_t conn_id)
-{
-    drmModeConnector* drm_conn = drmModeGetConnector(fd_drm, conn_id);
-    if (drm_conn == 0) {
-        perror("drmModeGetConnector()");
-        return 0;
-    }
-
-    struct Connector* conn = malloc(sizeof(struct Connector));
-    if (conn == 0) {
-        perror("malloc(struct Connector)");
-        drmModeFreeConnector(drm_conn);
-        return 0;
-    }
-    conn->drm_conn = drm_conn;
-    conn->conn_ix = conn_ix;
-    conn->good = (drm_conn->connection == DRM_MODE_CONNECTED) && (drm_conn->count_modes > 0);
-
-    int best_ix = -1;
-    int mode_ix;
-    for (mode_ix = 0; mode_ix < drm_conn->count_modes; mode_ix++) {
-        drmModeModeInfo* mode = &drm_conn->modes[mode_ix];
-        if (best_ix == -1) {
-            // default to first if none are preferred
-            best_ix = mode_ix;
-        }
-        if (mode->type & DRM_MODE_TYPE_PREFERRED) {
-            // stop searching after finding preferred
-            best_ix = mode_ix;
-            break;
-        }
-    }
-    conn->best_mode_ix = best_ix;
-    return conn;
-}
-
-void connector_free(struct Connector* conn)
-{
-    drmModeFreeConnector(conn->drm_conn);
-    free(conn);
-}
-
-void connector_print(struct Connector* conn, const char* dev_path, int* total_conn_ix, FILE* out)
-{
-    fprintf(out, "Output %i: Connector %i (%i) %s-%i %s",
-        (*total_conn_ix)++,
-        conn->conn_ix,
-        conn->drm_conn->connector_id,
-        drmModeGetConnectorTypeName(conn->drm_conn->connector_type),
-        conn->drm_conn->connector_type_id,
-        conn->drm_conn->connection == DRM_MODE_CONNECTED ?
-            "(connected)" : "(disconnected)");
-
-    if (conn->best_mode_ix >= 0) {
-        drmModeModeInfo* mode_info = &conn->drm_conn->modes[conn->best_mode_ix];
-        fprintf(out, " %ix%i@%i\n", mode_info->hdisplay, mode_info->vdisplay,
-            mode_info->vrefresh);
-    } else {
-        fprintf(out, "\n");
-    }
-}
-
-
-
-struct Card* card_create(const char* dev_path)
-{
-    int fd_drm = open(dev_path, O_RDWR | O_CLOEXEC);
-    if (fd_drm < 0) {
-        if (errno != ENOENT) {
-            fprintf(stderr, "Card %s: %s\n", dev_path, strerror(errno));
-        }
-        return 0;
-    }
-
-    drmModeRes* drm_res = drmModeGetResources(fd_drm);
-    if (drm_res == 0) {
-        //fprintf(stderr, "Card %s: no display resources.\n", dev_path);
-        close(fd_drm);
-        return 0;
-    }
-
-    struct Card* card = malloc(sizeof(struct Card));
-    if (card == 0) {
-        perror("malloc(struct Card)");
-        drmModeFreeResources(drm_res);
-        close(fd_drm);
-        return 0;
-    }
-    card->fd_drm = fd_drm;
-    card->drm_res = drm_res;
-    card->dev_path = strdup(dev_path);
-
-    STAILQ_INIT(&card->connectors);
-
-    int conn_ix;
-    for (conn_ix = 0; conn_ix < drm_res->count_connectors; conn_ix++) {
-        uint32_t conn_id = drm_res->connectors[conn_ix];
-        struct Connector* conn = connector_create(fd_drm, conn_ix, conn_id);
-        if (conn) {
-            STAILQ_INSERT_TAIL(&card->connectors, conn, pointers);
-        }
-    }
-
-    return card;
-}
-
-void card_free(struct Card* card)
-{
-    drmModeFreeResources(card->drm_res);
-    close(card->fd_drm);
-    free(card->dev_path);
-    free(card);
-}
-
-void card_print(struct Card* card, int* total_conn_ix, FILE* out)
-{
-    fprintf(out, "Card %s\n", card->dev_path);
-
-    struct Connector* conn;
-    STAILQ_FOREACH(conn, &card->connectors, pointers) {
-        connector_print(conn, card->dev_path, total_conn_ix, out);
-    }
-}
-
-// Populate the All_Cards list. Only call this once.
-// If a device path is given, only that device is opened.
-// If device path is null, all frame buffer cards are opened.
-// Return 0 if success and we found at least 1 output.
-int populate_cards(const char* dev_path_or_null)
-{
-    STAILQ_INIT(&All_Cards);
-
-    if (dev_path_or_null) {
-        // just the specified card
-        struct Card* card = card_create(dev_path_or_null);
-        if (card == 0) {
-            fprintf(stderr, "card_create(%s): %s\n", dev_path_or_null,
-                strerror(errno));
-            return -1;
-        }
-        STAILQ_INSERT_TAIL(&All_Cards, card, pointers);
-        return 0;
-    }
-
-    // Try /dev/dri/card0, card1, etc.
-    int outputs = 0;
-    int card;
-    for (card = 0; card < 10; card++) {
-        char card_path[64];
-        snprintf(card_path, sizeof(card_path), "/dev/dri/card%i", card);
-        //fprintf(stderr, "Opening %s\n", card_path);
-
-        struct Card* card = card_create(card_path);
-        if (card == 0) {
-            if (errno == ENOENT) {
-                // no more cards
-                break;
-            }
-            // else ignore error and try next card
-        }
-        else {
-            // found a card with connectors, add to global list
-            outputs += card->drm_res->count_connectors;
-            STAILQ_INSERT_TAIL(&All_Cards, card, pointers);
-        }
-    }
-    if (outputs == 0) {
-        fprintf(stderr, "No outputs found.\n");
-        errno = ENODEV;
-        return -1;
-    }
-    return 0;
-}
-
-// Show list of cards to user.
-// Command line flag: --list
-void print_all_cards(FILE* out)
-{
-    int total_conn_ix = 0;
-
-    struct Card* card;
-    STAILQ_FOREACH(card, &All_Cards, pointers) {
-        card_print(card, &total_conn_ix, out);
-    }
-}
-
-// The specific card and connector we will use.
-struct Card* My_Card = 0;
-struct Connector* My_Conn = 0;
-
-// Look through All_Cards and pick a card and connector to use.
-// output_ix is picked by the user --out=x, or -1 to pick the first
-// connected connector.
-void pick_output(int output_ix)
-{
-    int conn_ix = 0;
-
-    struct Card* card;
-    STAILQ_FOREACH(card, &All_Cards, pointers) {
-        struct Connector* conn;
-        STAILQ_FOREACH(conn, &card->connectors, pointers) {
-            if (output_ix == conn_ix || (output_ix == -1 && conn->good)) {
-                // Use this connector.
-                My_Card = card;
-                My_Conn = conn;
-                return;
-            }
-            conn_ix++;
-        }
-    }
-}
-
-// After we are done listing/picking, free resources we won't be using.
-void close_other_cards_and_connectors()
-{
-    struct Card* card;
-    while ((card = STAILQ_FIRST(&All_Cards))) {
-        if (card == My_Card) break;
-        STAILQ_REMOVE_HEAD(&All_Cards, pointers);
-        card_free(card);
-    }
-    if (card == 0) return;
-
-    struct Card* del;
-    while ((del = STAILQ_NEXT(card, pointers))) {
-        STAILQ_REMOVE(&All_Cards, del, Card, pointers);
-        card_free(del);
-    }
-
-    struct Connector* conn;
-    while ((conn = STAILQ_FIRST(&card->connectors))) {
-        if (conn == My_Conn) break;
-        STAILQ_REMOVE_HEAD(&card->connectors, pointers);
-        connector_free(conn);
-    }
-    if (conn == 0) return;
-
-    struct Connector* del_conn;
-    while ((del_conn = STAILQ_NEXT(conn, pointers))) {
-        STAILQ_REMOVE(&card->connectors, del_conn, Connector, pointers);
-        connector_free(del_conn);
-    }
 }
 
 // Match the beginning part of a string, and return pointer to
@@ -375,9 +98,8 @@ bool match_case_suffix_list(const char* s, ...)
     return match;
 }
 
-void print_usage(const char* fmt, ...)
+void print_usage(FILE* out, const char* fmt, ...)
 {
-    FILE* out = stderr;
     va_list ap;
     if (fmt) {
         va_start(ap, fmt);
@@ -417,6 +139,9 @@ void print_usage(const char* fmt, ...)
 
 int main(int argc, const char* argv[])
 {
+    File_Info = stdout;
+    File_Error = stderr;
+
     const char* arg_dev_path = 0;
     bool flag_list_outputs = false;
     int chose_output = -1;
@@ -425,21 +150,38 @@ int main(int argc, const char* argv[])
     int argi;
     // process initial command line args starting with '-'
     for (argi = 1; (arg = argv[argi]) && arg[0] == '-'; argi++) {
-        if ((arg = match_prefix(argv[argi], "--dev="))) {
+        if ((arg = match_prefix(argv[argi], "--dev=")))
+        {
             arg_dev_path = arg;
         }
-        else if (!strcmp(argv[argi], "--list")) {
+        else if ((arg = match_prefix(argv[argi], "--fmt=")))
+        {
+            uint32_t four_cc = str_to_four_cc(arg);
+            override_pixel_format_preference(four_cc);
+        }
+        else if (!strcmp(argv[argi], "-l") ||
+                 !strcmp(argv[argi], "--list"))
+        {
             flag_list_outputs = true;
         }
-        else if ((arg = match_prefix(argv[argi], "--out="))) {
+        else if ((arg = match_prefix(argv[argi], "-o=")) ||
+                 (arg = match_prefix(argv[argi], "--out=")))
+        {
             chose_output = strtoul(arg, 0, 10);
         }
-        else if (!strcmp(argv[argi], "-h") || !strcmp(argv[argi], "--help")) {
-            print_usage(0);
+        else if (!strcmp(argv[argi], "-v") ||
+                 !strcmp(argv[argi], "--verbose"))
+        {
+            Verbose = true;
+        }
+        else if (!strcmp(argv[argi], "-h") ||
+                 !strcmp(argv[argi], "--help"))
+        {
+            print_usage(File_Error, 0);
             return 0;
         }
         else {
-            print_usage("Bad option: %s\n", argv[argi]);
+            print_usage(File_Error, "Bad option: %s\n", argv[argi]);
             return 2;
         }
     }
@@ -447,14 +189,14 @@ int main(int argc, const char* argv[])
     populate_cards(arg_dev_path);
 
     if (flag_list_outputs) {
-        print_all_cards(stdout);
+        print_all_cards(File_Info);
         return 0;
     }
 
     pick_output(chose_output);
 
     if (My_Card == 0 || My_Conn == 0) {
-        fprintf(stderr, "No output found.\n");
+        fprintf(File_Error, "Error: No output found.\n");
         return 1;
     }
 
@@ -465,13 +207,26 @@ int main(int argc, const char* argv[])
     drmModeEncoder* encoder = drmModeGetEncoder(My_Card->fd_drm,
         My_Conn->drm_conn->encoder_id);
     if (encoder == 0) {
-        fprintf(stderr, "No encoder.\n");
+        fprintf(File_Error, "Error: No encoder.\n");
         return 1;
+    }
+
+    uint32_t pixel_format;
+    if (choose_pixel_format(&pixel_format)) {
+        fprintf(File_Error, "Error: No acceptable pixel format.\n");
+        return 1;
+    }
+    const struct Pixel_Format* pf = lookup_pixel_format(pixel_format);
+    uint32_t bytes_per_pixel = pf->bytes_per_pixel;
+
+    if (Verbose) {
+        fprintf(File_Info, "Picked '%s', %i bytes/pix\n",
+            four_cc_to_str(pixel_format), bytes_per_pixel);
     }
 
     uint32_t width = mode_info->hdisplay;
     uint32_t height = mode_info->vdisplay;
-    int err = create_two_frame_buffers(My_Card->fd_drm, width, height);
+    int err = create_two_frame_buffers(My_Card->fd_drm, width, height, pixel_format);
     if (err) {
         return 2;
     }
@@ -479,10 +234,7 @@ int main(int argc, const char* argv[])
     uint32_t crtc_id = encoder->crtc_id;
     drmModeCrtc* saved_crtc = drmModeGetCrtc(My_Card->fd_drm, crtc_id);
 
-    struct sigaction act = { 0 };
-    act.sa_handler = ctrl_c_handler;
-    act.sa_flags = 0; // no SA_RESTART, otherwise fgets blocks ctrl+c
-    sigaction(SIGINT, &act, 0);
+    install_ctrl_c_handler();
 
     // Double buffering:
     // First buffer uses drmModeSetCrtc().
@@ -509,7 +261,10 @@ int main(int argc, const char* argv[])
         }
 
         // skip empty lines
-        if (*command == 0) continue;
+        if (*command == 0) {
+            //continue;
+            command = "flip";
+        }
 
         if (!strcmp(command, "black")) {
             fill_rect(FB0, 0x000000, 0, 0, -1, -1);
@@ -519,6 +274,9 @@ int main(int argc, const char* argv[])
         }
         else if (!strcmp(command, "clear")) {
             fill_rect(FB0, BG_Color, 0, 0, -1, -1);
+        }
+        else if (!strcmp(command, "flip")) {
+            // swap buffers again without drawing
         }
         else if ((arg = match_prefix(command, "wait:"))) {
             // pause for x.x seconds
@@ -584,7 +342,7 @@ int main(int argc, const char* argv[])
                 filename = command;
             }
             else {
-                fprintf(stderr, "Unknown image file type: %s\n", command);
+                fprintf(File_Error, "Error: Unknown file type: %s\n", command);
                 continue;
             }
 
