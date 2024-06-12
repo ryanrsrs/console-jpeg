@@ -126,6 +126,7 @@ void print_usage(FILE* out, const char* fmt, ...)
     fprintf(out, "file.jpg       No prefix, determine type from extension.\n");
     fprintf(out, "flip           Swap buffers without drawing for fast A/B comparison.\n");
     fprintf(out, "wait:1.23      Pause x seconds.\n");
+    fprintf(out, "save:out.png   Save framebuffer as png. (for debugging)\n");
     fprintf(out, "halt           Stop forever (Ctrl-C to quit).\n");
     fprintf(out, "exit           Quit program.\n");
     fprintf(out, "sleep          Put the display to sleep.\n");
@@ -288,6 +289,11 @@ int main(int argc, const char* argv[])
         else if ((arg = match_prefix(command, "bgcolor:"))) {
             BG_Color = strtoul(arg, 0, 16);
             continue; // no drawing, don't flip the buffers
+        }
+        else if ((arg = match_prefix(command, "save:"))) {
+            write_png(arg, FB1); // write previous framebuffer, i.e.
+                                 // the one currently on the screen.
+            continue; // don't flip the buffers
         }
         else if (!strcmp(command, "sleep")) {
             // put display to sleep

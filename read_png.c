@@ -258,3 +258,159 @@ Cleanup:
 
     return ret;
 }
+
+int write_png(const char* filename, struct Frame_Buffer* fb)
+{
+    double t0 = 0;
+    double t1 = 0;
+    double t2 = 0;
+
+    if (Verbose) {
+        t0 = time_f();
+        fprintf(File_Info, "\nWrite PNG %s\n", filename);
+    }
+
+    FILE* png_file = 0;
+    spng_ctx* ctx = 0;
+    uint8_t* temp_pixels = 0;
+    size_t temp_size;
+    int ret = 0;
+    int err = 0;
+
+    const uint8_t* pixel_src;
+    uint8_t* pixel_dst;
+
+    int img_w = fb->width;
+    int img_h = fb->height;
+
+    struct spng_ihdr ihdr = { 0 };
+    ihdr.width = img_w;
+    ihdr.height = img_h;
+    ihdr.color_type = SPNG_COLOR_TYPE_TRUECOLOR;
+    ihdr.bit_depth = 8;
+
+    png_file = fopen(filename, "wb");
+    if (png_file == 0) {
+        fprintf(File_Error, "Error: Can't create png file %s\n", filename);
+        ret = -1;
+        goto Cleanup;
+    }
+
+    ctx = spng_ctx_new(SPNG_CTX_ENCODER);
+    if (ctx == 0) {
+        fprintf(File_Error, "Error: spng_ctx_new(SPNG_CTX_ENCODER) failed.\n");
+        ret = -1;
+        goto Cleanup;
+    }
+
+    err = spng_set_png_file(ctx, png_file);
+    if (err) {
+        fprintf(File_Error, "Error: spng_set_png_file() %s\n",
+                spng_strerror(err));
+        ret = -1;
+        goto Cleanup;
+    }
+
+    err = spng_set_ihdr(ctx, &ihdr);
+    if (err) {
+        fprintf(File_Error, "Error: spng_set_ihdr() %s\n",
+                spng_strerror(err));
+        ret = -1;
+        goto Cleanup;
+    }
+
+    temp_size = img_w * 3 * img_h;
+    temp_pixels = malloc(temp_size);
+
+    pixel_src = get_pixels(fb, 0, 0);
+    pixel_dst = temp_pixels;
+    if (fb->pixel_format == DRM_FORMAT_BGR888) {
+        int y, bytes = img_w * 3;
+        for (y = 0; y < img_h; y++) {
+            memcpy(pixel_dst, pixel_src, bytes);
+            pixel_src += fb->stride;
+            pixel_dst += bytes;
+        }
+    }
+    else if (fb->pixel_format == DRM_FORMAT_RGB888) {
+        int x, y;
+        for (y = 0; y < img_h; y++) {
+            for (x = 0; x < img_w; x++) {
+                pixel_dst[0] = pixel_src[2];
+                pixel_dst[1] = pixel_src[1];
+                pixel_dst[2] = pixel_src[0];
+                pixel_src += 3;
+                pixel_dst += 3;
+            }
+            pixel_src += fb->stride - 3 * img_w;
+        }
+    }
+    else if (fb->pixel_format == DRM_FORMAT_BGRA8888 ||
+             fb->pixel_format == DRM_FORMAT_BGRX8888)
+    {
+        int x, y;
+        for (y = 0; y < img_h; y++) {
+            for (x = 0; x < img_w; x++) {
+                pixel_dst[0] = pixel_src[0];
+                pixel_dst[1] = pixel_src[1];
+                pixel_dst[2] = pixel_src[2];
+                pixel_src += 4;
+                pixel_dst += 3;
+            }
+            pixel_src += fb->stride - 4 * img_w;
+        }
+    }
+    else if (fb->pixel_format == DRM_FORMAT_RGBA8888 ||
+             fb->pixel_format == DRM_FORMAT_RGBX8888)
+    {
+        int x, y;
+        for (y = 0; y < img_h; y++) {
+            for (x = 0; x < img_w; x++) {
+                pixel_dst[0] = pixel_src[2];
+                pixel_dst[1] = pixel_src[1];
+                pixel_dst[2] = pixel_src[0];
+                pixel_src += 4;
+                pixel_dst += 3;
+            }
+            pixel_src += fb->stride - 4 * img_w;
+        }
+    }
+    else {
+        fprintf(File_Error, "Error: Unknown pixel format '%s'\n",
+            four_cc_to_str(fb->pixel_format));
+        goto Cleanup;
+    }
+
+    if (Verbose) t1 = time_f();
+
+    ret = spng_encode_image(ctx, temp_pixels, temp_size, SPNG_FMT_PNG,
+                SPNG_ENCODE_FINALIZE);
+    if (err) {
+        fprintf(File_Error, "Error: spng_encode_image() %s\n",
+                spng_strerror(err));
+        ret = -1;
+        goto Cleanup;
+    }
+
+    if (Verbose) {
+        t2 = time_f();
+
+        long png_size = ftell(png_file);
+        fprintf(File_Info, "  source %5i x %5i  '%s'\n", img_w, img_h,
+                four_cc_to_str(fb->pixel_format));
+        fprintf(File_Info, "  wrote %li bytes\n", png_size);
+        fprintf(File_Info, "  setup  %6.3f sec\n", t1 - t0);
+        fprintf(File_Info, "  encode %6.3f sec\n", t2 - t1);
+    }
+
+    ret = 0;
+
+Cleanup:
+    if (temp_pixels) free(temp_pixels);
+    if (ctx) spng_ctx_free(ctx);
+    if (png_file) fclose(png_file);
+
+    if (Verbose) fprintf(File_Info, "  total  %6.3f sec\n", time_f() - t0);
+
+    return ret;
+}

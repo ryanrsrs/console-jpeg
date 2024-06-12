@@ -3,4 +3,6 @@
 
 int read_png(const char* filename, struct Frame_Buffer* fb);
 
+int write_png(const char* filename, struct Frame_Buffer* fb);
+
 #endif
